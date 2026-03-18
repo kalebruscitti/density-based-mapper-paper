@@ -1,9 +1,10 @@
-import networkx as nx
 from collections import defaultdict, deque
-from toponymy.clustering import Clusterer, build_cluster_tree, centroids_from_labels, ClusterLayerText
+from toponymy.clustering import Clusterer, build_cluster_tree, centroids_from_labels
+from toponymy.cluster_layer import ClusterLayerText 
 from temporalmapper import TemporalMapper
 from toponymy._utils import handle_verbose_params
 from copy import deepcopy
+import networkx as nx
 import numpy as np
 from scipy.sparse import issparse
 from sklearn.utils.validation import check_is_fitted, check_array
@@ -40,8 +41,9 @@ class UnionFind:
 
 
 def convert(node, layer):
-    t,c = node.split(":")
+    t, c = node.split(":")
     return (layer, int(c))
+
 
 def merge_trees(topic_trees, graphs):
     """
@@ -97,13 +99,13 @@ def merge_trees(topic_trees, graphs):
 
         for node in nodes:
             tree_index = slice_no[node]
-            parent_node = parent_lookup[tree_index][convert(node,l)]
+            parent_node = parent_lookup[tree_index][convert(node, l)]
 
             # Determine parent equivalence class
             if parent_node == (n_layers, 0):
                 parent_class = None
             else:
-                _,pc = parent_node
+                _, pc = parent_node
                 parent_class = result[l + 1][f'{tree_index}:{pc}']
 
             key = (topics[node], parent_class)
@@ -134,6 +136,104 @@ def merge_trees(topic_trees, graphs):
 
     return result
 
+
+def _make_padding_tree(n_aligned_layers):
+    """
+    Build a cluster tree for a padding layer (all-noise layer).
+    The padding layer sits at aligned index 0 and has no children in the
+    layer below, so it only needs a root entry pointing to the sentinel.
+    The tree is keyed by aligned layer index: {(layer, cluster): [children]}.
+    Since the layer is all-noise there are no real clusters, so only the
+    sentinel root (n_aligned_layers, 0) is needed.
+    """
+    return {(n_aligned_layers, 0): []}
+
+
+def _align_slice_layers(slicewise_layers, topic_trees, n_layers):
+    """
+    Align per-slice layer lists to a common depth ``n_layers``, coarse-end
+    aligned.  Slices with fewer than ``n_layers`` layers get padding inserted
+    at the *fine* end (index 0) so that the coarsest layer in every slice
+    always occupies index ``n_layers - 1``.
+
+    Padding layers contain all-noise labels (-1 for every point in the
+    slice) and a cluster tree with no children at the fine end.
+
+    Parameters
+    ----------
+    slicewise_layers : list of list of ClusterLayer
+        ``slicewise_layers[i]`` is the list of ClusterLayer objects produced
+        by the base clusterer for slice ``i``, ordered fine → coarse.
+    topic_trees : list of dict
+        ``topic_trees[i]`` is the cluster tree returned alongside
+        ``slicewise_layers[i]``.
+    n_layers : int
+        Target number of layers (== max across all slices).
+
+    Returns
+    -------
+    aligned_layers : list of list of ClusterLayer
+        Same structure as ``slicewise_layers`` but every inner list has
+        length ``n_layers``.
+    aligned_trees : list of dict
+        Cluster trees whose layer indices have been shifted to match the
+        aligned indexing.
+    """
+    aligned_layers = []
+    aligned_trees = []
+
+    for i, (layers, tree) in enumerate(zip(slicewise_layers, topic_trees)):
+        k = len(layers)
+        pad = n_layers - k  # number of padding layers needed at the fine end
+
+        if pad == 0:
+            aligned_layers.append(list(layers))
+            aligned_trees.append(tree)
+            continue
+
+        # ------------------------------------------------------------------
+        # Build padding ClusterLayer objects.
+        # Each padding layer has all points in the slice labelled as noise
+        # (-1).  We reuse the finest real layer's centroid_vectors shape but
+        # fill labels with -1.
+        # ------------------------------------------------------------------
+        finest_real = layers[0]
+        n_points = len(finest_real.cluster_labels)
+        noise_labels = np.full(n_points, -1, dtype=int)
+        # centroid_vectors must have shape (n_clusters, n_features); with
+        # zero real clusters we use an empty array.
+        empty_centroids = np.empty((0, finest_real.centroid_vectors.shape[1]))
+
+        padding_layer_objects = [
+            type(finest_real)(
+                cluster_labels=noise_labels.copy(),
+                centroid_vectors=empty_centroids.copy(),
+                layer_id=j,
+            )
+            for j in range(pad)
+        ]
+
+        aligned_layers.append(padding_layer_objects + list(layers))
+
+        # ------------------------------------------------------------------
+        # Shift the cluster-tree keys/values so that the original layer
+        # indices (0 … k-1) become (pad … n_layers-1).
+        # Padding layers (0 … pad-1) have no children so they are omitted
+        # from the tree entirely; the sentinel root stays at (n_layers, 0).
+        # ------------------------------------------------------------------
+        shifted_tree = {}
+        for (pl, pc), children in tree.items():
+            new_parent = (pl + pad if pl != n_layers else n_layers, pc)
+            new_children = [
+                (cl + pad, cc) for cl, cc in children
+            ]
+            shifted_tree[new_parent] = new_children
+
+        aligned_trees.append(shifted_tree)
+
+    return aligned_layers, aligned_trees
+
+
 class MapperClusterer(Clusterer):
     def __init__(
         self,
@@ -157,7 +257,7 @@ class MapperClusterer(Clusterer):
         clusterable_vectors: np.ndarray,
         embedding_vectors: np.ndarray,
         projection_index: int = -1,
-        layer_class = ClusterLayerText,
+        layer_class=ClusterLayerText,
         verbose: bool = None,
         show_progress_bar: bool = None,
         **layer_kwargs,
@@ -167,64 +267,105 @@ class MapperClusterer(Clusterer):
             show_progress_bar=show_progress_bar,
             default_verbose=False,
         )
+
         base_mapper = TemporalMapper(
-            clusterer = None,
+            clusterer=None,
             **self.mapper_params,
         )
         lens = clusterable_vectors[:, projection_index]
-        data = np.delete(
-            clusterable_vectors,
-            projection_index,
-            axis=1
-        )
+        data = np.delete(clusterable_vectors, projection_index, axis=1)
+
         if issparse(clusterable_vectors):
             base_mapper._mapper.scaler_ = StandardScaler(copy=False, with_mean=False)
         else:
             base_mapper._mapper.scaler_ = StandardScaler(copy=False)
+
         base_mapper._mapper._compute_midpoints(lens)
         base_mapper._mapper._compute_density(data, lens)
         base_mapper._mapper._compute_weights(data, lens)
+
         n_layers = 0
         topic_trees = []
-        graphs = []
-        mappers = []
         slicewise_layers = []
         n_slices = len(base_mapper._mapper.slices_)
+
+        # ------------------------------------------------------------------
+        # Cluster each slice independently
+        # ------------------------------------------------------------------
         for i, slice_ in enumerate(base_mapper._mapper.slices_):
             cvectors = data[slice_]
             evectors = embedding_vectors[slice_]
-            cluster_layers, cluster_tree  = self.base_clusterer.fit_predict(
-                clusterable_vectors = cvectors,
-                embedding_vectors = evectors,
-                layer_class=layer_class,
-                verbose=verbose,
-                show_progress_bar=show_progress_bar,
-                **layer_kwargs,
-            )
-            if len(cluster_layers)>n_layers:
+            try:
+                cluster_layers, cluster_tree = self.base_clusterer.fit_predict(
+                    clusterable_vectors=cvectors,
+                    embedding_vectors=evectors,
+                    layer_class=layer_class,
+                    verbose=verbose,
+                    show_progress_bar=show_progress_bar,
+                    **layer_kwargs,
+                )
+            except Exception as e:
+                raise ValueError(
+                    f"Base clusterer failed on slice {i} "
+                    f"({len(slice_)} points). "
+                    "Try adjusting mapper parameters (e.g. reducing n_slices "
+                    "or increasing overlap) or clusterer parameters "
+                    "(e.g. reducing base_min_cluster_size)."
+                ) from e
+
+            if len(cluster_layers) == 0:
+                raise ValueError(
+                    f"Base clusterer returned no layers for slice {i} "
+                    f"({len(slice_)} points). "
+                    "Try adjusting mapper parameters (e.g. reducing n_slices "
+                    "or increasing overlap) or clusterer parameters "
+                    "(e.g. reducing base_min_cluster_size)."
+                )
+
+            if len(cluster_layers) > n_layers:
                 n_layers = len(cluster_layers)
             topic_trees.append(cluster_tree)
             slicewise_layers.append(cluster_layers)
-        print(f"Layers per slice: {[len(x) for x in slicewise_layers]}")
-        for l in range(n_layers):
-            sizes = []
-            for clayers in slicewise_layers:
-                n_clusters = np.unique(clayers[l].cluster_labels).size
-                sizes.append(n_clusters)
-            print(f"Layer {l} n_cluster: {sizes}")
 
-        layer_clusters = []
+        if verbose_output:
+            print(f"Layers per slice (before alignment): {[len(x) for x in slicewise_layers]}")
+
+        # ------------------------------------------------------------------
+        # Align layers coarse-end first; pad fine end with noise layers
+        # ------------------------------------------------------------------
+        slicewise_layers, topic_trees = _align_slice_layers(
+            slicewise_layers, topic_trees, n_layers
+        )
+
+        if verbose_output:
+            for l in range(n_layers):
+                sizes = []
+                for clayers in slicewise_layers:
+                    n_clusters = int(np.max(clayers[l].cluster_labels) + 1)
+                    sizes.append(n_clusters)
+                print(f"Layer {l} n_clusters (after alignment): {sizes}")
+
+        # ------------------------------------------------------------------
+        # Build one Mapper graph per aligned layer
+        # ------------------------------------------------------------------
+        mappers = []
+        graphs = []
+
+        # Precompute distance from each point to each midpoint for tie-breaking
+        dist_to_midpoints = cdist(
+            base_mapper._mapper.midpoints_.reshape(-1, 1),
+            lens.reshape(-1, 1),
+        )  # shape: (n_slices, n_points)
+
         for l in range(n_layers):
-            if l>=len(cluster_layers):
-                break
             mapper = deepcopy(base_mapper)
             labels = np.full((n_slices, data.shape[0]), -2, dtype=int)
             for i, slice_ in enumerate(base_mapper._mapper.slices_):
-                labels[i,slice_] = slicewise_layers[i][l].cluster_labels
+                labels[i, slice_] = slicewise_layers[i][l].cluster_labels
 
             mapper._mapper.labels_ = np.array(labels)
             mapper._mapper._add_vertices()
-            mapper._mapper._build_adjacency_matrix(lens)
+            mapper._mapper._build_adjacency_matrix(lens)  # fix: was `time`
             mapper._mapper._add_edges()
             mapper._mapper.is_fitted_ = True
             mapper.data = data
@@ -232,43 +373,54 @@ class MapperClusterer(Clusterer):
             mapper.n_samples = data.shape[0]
             mapper.n_components = data.shape[1]
             mapper.populate_node_attrs()
-            t_attrs = nx.get_node_attributes(mapper.graph, "slice_no")
             mapper.populate_edge_attrs()
             mapper.is_fitted_ = True
             mapper.assign_topics()
-            # Run the clustering logic from TemporalMapper.cluster
-            dist = cdist(
-                mapper._mapper.midpoints_.reshape(-1,1),
-                lens.reshape(-1,1)
-            )
-            pt_max_cluster = np.argmin(
-                dist,
-                axis=0
-            )
-            topics = nx.get_node_attributes(mapper.graph, 'topic')
-            clusters = []
-            clrs = []
-            for pt,t in enumerate(pt_max_cluster):
-                c = mapper.clusters[t,pt]
-                clrs.append(c)
-                if c != -2:
-                    clusters.append(f'{t}:{c}')
-                elif c == -2:
-                    clusters.append(f'{t}:{-1}')
-
-            layer_clusters.append(clusters)
             mappers.append(mapper)
             graphs.append(mapper.graph)
 
+        # ------------------------------------------------------------------
+        # Assign each point to its best slice, then read its cluster label.
+        #
+        # Primary key:   highest kernel weight  (weights_[t, pt])
+        # Tiebreak:      closest midpoint in time (argmin dist_to_midpoints)
+        #
+        # A point whose best slice gives label -2 (not in slice at all) falls
+        # back to noise (-1).
+        # ------------------------------------------------------------------
+        weights = base_mapper._mapper.weights_  # (n_slices, n_points)
+
+        # Lexicographic maximisation: primary = weight, secondary = -dist.
+        # We encode this as a single float: weight + tiny * (-dist_normalised)
+        # so that ties in weight are broken by proximity.
+        dist_norm = dist_to_midpoints / (dist_to_midpoints.max() + 1e-12)
+        score = weights - 1e-6 * dist_norm  # (n_slices, n_points)
+        best_slice = np.argmax(score, axis=0)  # (n_points,)
+
+        for l in range(n_layers):
+            clusters = []
+            for pt, t in enumerate(best_slice):
+                c = mappers[l].clusters[t, pt]
+                if c != -2:
+                    clusters.append(f'{t}:{c}')
+                else:
+                    clusters.append(f'{t}:{-1}')
+
+        # ------------------------------------------------------------------
+        # Merge the per-slice topic trees across the Mapper graph
+        # ------------------------------------------------------------------
         topic_map = merge_trees(topic_trees, graphs)
-        # now assign each point its merged cluster val
+
+        # ------------------------------------------------------------------
+        # Produce final flat cluster label arrays, one per aligned layer
+        # ------------------------------------------------------------------
         cluster_label_layers = []
         for l in range(n_layers):
-            clusters = np.full(data.shape[0], -1, dtype=int)
+            final_labels = np.full(data.shape[0], -1, dtype=int)
             for node in graphs[l].nodes():
                 indices = mappers[l].get_vertex_data(node)
-                clusters[indices] = topic_map[l][node]
-            cluster_label_layers.append(clusters)
+                final_labels[indices] = topic_map[l][node]
+            cluster_label_layers.append(final_labels)
 
         self.cluster_tree_ = build_cluster_tree(cluster_label_layers)
         self.cluster_layers_ = [
@@ -290,7 +442,7 @@ class MapperClusterer(Clusterer):
         self,
         clusterable_vectors: np.ndarray,
         embedding_vectors: np.ndarray,
-        layer_class = ClusterLayerText,
+        layer_class=ClusterLayerText,
         verbose: bool = None,
         show_progress_bar: bool = None,
         **layer_kwargs,
