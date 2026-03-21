@@ -379,14 +379,14 @@ class MapperClusterer(Clusterer):
             mappers.append(mapper)
             graphs.append(mapper.graph)
 
+
         # ------------------------------------------------------------------
-        # Assign each point to its best slice, then read its cluster label.
-        #
-        # Primary key:   highest kernel weight  (weights_[t, pt])
-        # Tiebreak:      closest midpoint in time (argmin dist_to_midpoints)
-        #
-        # A point whose best slice gives label -2 (not in slice at all) falls
-        # back to noise (-1).
+        # Merge the per-slice topic trees across the Mapper graph
+        # ------------------------------------------------------------------
+        topic_map = merge_trees(topic_trees, graphs)
+
+        # ------------------------------------------------------------------
+        # Produce final flat cluster label arrays, one per aligned layer
         # ------------------------------------------------------------------
         weights = base_mapper._mapper.weights_  # (n_slices, n_points)
 
@@ -397,30 +397,23 @@ class MapperClusterer(Clusterer):
         score = weights - 1e-6 * dist_norm  # (n_slices, n_points)
         best_slice = np.argmax(score, axis=0)  # (n_points,)
 
-        for l in range(n_layers):
-            clusters = []
-            for pt, t in enumerate(best_slice):
-                c = mappers[l].clusters[t, pt]
-                if c != -2:
-                    clusters.append(f'{t}:{c}')
-                else:
-                    clusters.append(f'{t}:{-1}')
-
-        # ------------------------------------------------------------------
-        # Merge the per-slice topic trees across the Mapper graph
-        # ------------------------------------------------------------------
-        topic_map = merge_trees(topic_trees, graphs)
-
-        # ------------------------------------------------------------------
-        # Produce final flat cluster label arrays, one per aligned layer
-        # ------------------------------------------------------------------
         cluster_label_layers = []
         for l in range(n_layers):
-            final_labels = np.full(data.shape[0], -1, dtype=int)
-            for node in graphs[l].nodes():
-                indices = mappers[l].get_vertex_data(node)
-                final_labels[indices] = topic_map[l][node]
-            cluster_label_layers.append(final_labels)
+            clusters = np.full(data.shape[0], -1, dtype=int)
+            for pt, t in enumerate(best_slice):
+                c = mappers[l].clusters[t, pt]
+                if c not in {-1,-2}:
+                    clusters[pt] = topic_map[l][f'{t}:{c}']
+                else:
+                    clusters[pt] = -1
+
+            unique = np.unique(clusters)
+            non_noise = unique[unique != -1]
+            remap = {old: new for new, old in enumerate(sorted(non_noise))}
+            remap[-1] = -1
+        
+            clusters = np.array([remap[v] for v in clusters], dtype=int)
+            cluster_label_layers.append(clusters)
 
         self.cluster_tree_ = build_cluster_tree(cluster_label_layers)
         self.cluster_layers_ = [
