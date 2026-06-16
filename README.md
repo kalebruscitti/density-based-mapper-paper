@@ -1,6 +1,6 @@
 ## Density-Based Mapper Paper
 This repository holds python code and Jupyter notebooks used to generate the figures in the paper
-`Density-Adaptive Mapper for Topic Modelling]{Density-Adaptive Mapper Covers for Temporal Topic Modelling`
+`Density-Adaptive Mapper Covers for Temporal Topic Modelling`
 
 There are two subfolders, `ungdc` contains notebooks related to temporal topic modelling of the United
 Nations general debate corpus, and `synthetic-data` contains code for the computational experiments on
