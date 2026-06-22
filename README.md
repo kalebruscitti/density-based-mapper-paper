@@ -6,6 +6,15 @@ There are two subfolders, `ungdc` contains notebooks related to temporal topic m
 Nations general debate corpus, and `synthetic-data` contains code for the computational experiments on
 synethetically generated data.
 
+### Temporal-Mapper Package Repository
+The implementation of density-based Mapper is in another repository:
+
+    https://www.github.com/tutteinstitute/temporal-mapper
+
+This implementation is also uploaded to PyPI as the `temporal-mapper` package, and it is this package 
+which is imported and used in this repository.
+
+
 ### Running the United Nations modelling code
 The input data for the UNGDC is too large to host on GitHub, so you will need to fetch it. It is available at on Kaggle, at:
 
