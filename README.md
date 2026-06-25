@@ -14,6 +14,10 @@ The implementation of density-based Mapper is in another repository:
 This implementation is also uploaded to PyPI as the `temporal-mapper` package, and it is this package 
 which is imported and used in this repository.
 
+### Interactive & Static United Nations figures
+There are static figure (png) and interactive HTML files with visualizations of Mapper graphs for the UN dataset
+in the folder `ungdc/UN-Mappers/images`.
+
 
 ### Running the United Nations modelling code
 The input data for the UNGDC is too large to host on GitHub, so you will need to fetch it. It is available at on Kaggle, at:
